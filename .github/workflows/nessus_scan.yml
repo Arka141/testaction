@@ -1,9 +1,12 @@
 name: Nessus Port Scan
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * *' # Runs daily at midnight UTC
+  push:               # Trigger on every push (i.e., commit) to any branch
+    branches:
+      - main          # Change this to your default branch if not 'main'
+  schedule:           # Trigger every midnight
+    - cron: '0 0 * * *'
+  workflow_dispatch:  # Allow manual trigger
 
 jobs:
   nessus_scan:
@@ -13,120 +16,90 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v3
 
-      - name: Authenticate with Nessus API
-        id: authenticate
+      - name: Install Dependencies
         run: |
-          response=$(curl -k -X POST "$NESSUS_HOST/session" \
+          sudo apt-get update
+          sudo apt-get install -y wget jq
+
+      - name: Download and Install Nessus
+        run: |
+          wget https://www.tenable.com/downloads/api/v1/public/pages/nessus/downloads/13635/download?i_agree_to_tenable_license_agreement=true -O Nessus-10.2.0-ubuntu1110_amd64.deb
+          sudo dpkg -i Nessus-10.2.0-ubuntu1110_amd64.deb
+
+      - name: Start Nessus Service
+        run: |
+          sudo /bin/systemctl start nessusd.service
+          sudo /bin/systemctl enable nessusd.service
+
+      - name: Wait for Nessus to Initialize
+        run: |
+          until curl -k https://localhost:8834/server/status -o /dev/null; do
+            echo "Waiting for Nessus to start..."
+            sleep 10
+          done
+          echo "Nessus is up and running!"
+
+      - name: Activate Nessus
+        run: |
+          curl -k -X POST https://localhost:8834/session \
           -H "Content-Type: application/json" \
-          -d "{\"username\":\"$NESSUS_USERNAME\",\"password\":\"$NESSUS_PASSWORD\"}")
-          token=$(echo $response | jq -r '.token')
-          if [ "$token" == "null" ]; then
-            echo "Failed to authenticate with Nessus API"
-            exit 1
-          fi
-          echo "::set-output name=token::$token"
+          -d "{\"username\":\"admin\",\"password\":\"password\"}"
+          curl -k -X POST https://localhost:8834/server/properties \
+          -H "X-Cookie: token=your_token" \
+          -d "{\"license\": {\"code\":\"YOUR_ACTIVATION_CODE\"}}"
         env:
-          NESSUS_HOST: ${{ secrets.NESSUS_HOST }}
-          NESSUS_USERNAME: ${{ secrets.NESSUS_USERNAME }}
-          NESSUS_PASSWORD: ${{ secrets.NESSUS_PASSWORD }}
+          NESSUS_ACTIVATION_CODE: ${{ secrets.NESSUS_ACTIVATION_CODE }}
 
-      - name: Get Policy ID
-        id: get_policy
+      - name: Create Nessus Scan Policy
         run: |
-          policies=$(curl -k -X GET "$NESSUS_HOST/policies" \
-          -H "X-Cookie: token=${{ steps.authenticate.outputs.token }}" \
-          -H "Content-Type: application/json")
-          policy_id=$(echo $policies | jq -r ".policies[] | select(.name==\"$SCAN_POLICY_NAME\") | .id")
-          if [ -z "$policy_id" ]; then
-            echo "Policy with name $SCAN_POLICY_NAME not found"
-            exit 1
-          fi
-          echo "::set-output name=policy_id::$policy_id"
-        env:
-          NESSUS_HOST: ${{ secrets.NESSUS_HOST }}
-          SCAN_POLICY_NAME: ${{ secrets.SCAN_POLICY_NAME }}
+          curl -k -X POST https://localhost:8834/policies \
+          -H "X-Cookie: token=your_token" \
+          -d '{
+                "settings": {
+                  "name": "GitHub Actions Port Scan",
+                  "text_targets": "http://altoro.testfire.net/",
+                  "policy_id": 1,
+                  "enabled": true
+                }
+              }'
 
-      - name: Create Scan
-        id: create_scan
+      - name: Launch Nessus Scan
         run: |
-          scan_data='{
-            "uuid": "",
-            "settings": {
-              "name": "Automated Port Scan - $(date +%Y-%m-%d_%H-%M-%S)",
-              "description": "Automated scan launched by GitHub Actions",
-              "policy_id": '${{ steps.get_policy.outputs.policy_id }}',
-              "text_targets": "'${{ secrets.SCAN_TARGET }}'"
-            }
-          }'
-          response=$(curl -k -X POST "$NESSUS_HOST/scans" \
-          -H "X-Cookie: token=${{ steps.authenticate.outputs.token }}" \
-          -H "Content-Type: application/json" \
-          -d "$scan_data")
-          scan_id=$(echo $response | jq -r '.scan.id')
-          if [ -z "$scan_id" ]; then
-            echo "Failed to create scan"
-            exit 1
-          fi
-          echo "::set-output name=scan_id::$scan_id"
-        env:
-          NESSUS_HOST: ${{ secrets.NESSUS_HOST }}
+          scan_id=$(curl -k -X POST https://localhost:8834/scans \
+          -H "X-Cookie: token=your_token" \
+          -d '{
+                "uuid": "your_policy_uuid",
+                "settings": {
+                  "name": "Automated GitHub Actions Port Scan",
+                  "policy_id": 1
+                }
+              }' | jq -r '.scan.id')
+          curl -k -X POST https://localhost:8834/scans/${scan_id}/launch \
+          -H "X-Cookie: token=your_token"
 
-      - name: Launch Scan
-        run: |
-          response=$(curl -k -X POST "$NESSUS_HOST/scans/${{ steps.create_scan.outputs.scan_id }}/launch" \
-          -H "X-Cookie: token=${{ steps.authenticate.outputs.token }}" \
-          -H "Content-Type: application/json")
-          scan_uuid=$(echo $response | jq -r '.scan_uuid')
-          if [ -z "$scan_uuid" ]; then
-            echo "Failed to launch scan"
-            exit 1
-          fi
-          echo "::set-output name=scan_uuid::$scan_uuid"
-
-      - name: Monitor Scan Progress
+      - name: Monitor Nessus Scan Progress
         run: |
           status="running"
           while [ "$status" == "running" ] || [ "$status" == "pending" ]; do
             sleep 30
-            response=$(curl -k -X GET "$NESSUS_HOST/scans/${{ steps.create_scan.outputs.scan_id }}" \
-            -H "X-Cookie: token=${{ steps.authenticate.outputs.token }}" \
-            -H "Content-Type: application/json")
-            status=$(echo $response | jq -r '.info.status')
+            status=$(curl -k -X GET https://localhost:8834/scans/${scan_id} \
+            -H "X-Cookie: token=your_token" | jq -r '.info.status')
             echo "Current scan status: $status"
           done
-          if [ "$status" != "completed" ]; then
-            echo "Scan did not complete successfully"
-            exit 1
-          fi
 
-      - name: Export Scan Report
-        id: export_scan
+      - name: Export and Upload Nessus Scan Report
         run: |
-          export_data='{
-            "format": "html",
-            "chapters": "vuln_hosts_summary"
-          }'
-          response=$(curl -k -X POST "$NESSUS_HOST/scans/${{ steps.create_scan.outputs.scan_id }}/export" \
-          -H "X-Cookie: token=${{ steps.authenticate.outputs.token }}" \
-          -H "Content-Type: application/json" \
-          -d "$export_data")
-          file_id=$(echo $response | jq -r '.file')
-          if [ -z "$file_id" ]; then
-            echo "Failed to export scan report"
-            exit 1
-          fi
-          echo "::set-output name=file_id::$file_id"
-
-      - name: Download Scan Report
-        run: |
-          curl -k -X GET "$NESSUS_HOST/scans/${{ steps.create_scan.outputs.scan_id }}/export/${{ steps.export_scan.outputs.file_id }}/download" \
-          -H "X-Cookie: token=${{ steps.authenticate.outputs.token }}" \
-          -o nessus_report.html
-        env:
-          NESSUS_HOST: ${{ secrets.NESSUS_HOST }}
-
-      - name: Upload Scan Report as Artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: nessus-scan-report
-          path: nessus_report.html
+          file_id=$(curl -k -X POST https://localhost:8834/scans/${scan_id}/export \
+          -H "X-Cookie: token=your_token" \
+          -d '{
+                "format": "html",
+                "chapters": "vuln_hosts_summary"
+              }' | jq -r '.file')
+          curl -k -X GET https://localhost:8834/scans/${scan_id}/export/${file_id}/download \
+          -H "X-Cookie: token=your_token" -o nessus_scan_report.html
+          
+          # Upload the report as an artifact
+          uses: actions/upload-artifact@v3
+          with:
+            name: nessus-scan-report
+            path: nessus_scan_report.html
