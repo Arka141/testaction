@@ -112,4 +112,21 @@ jobs:
           -d "$export_data")
           file_id=$(echo $response | jq -r '.file')
           if [ -z "$file_id" ]; then
-            echo "Failed to export scan report
+            echo "Failed to export scan report"
+            exit 1
+          fi
+          echo "::set-output name=file_id::$file_id"
+
+      - name: Download Scan Report
+        run: |
+          curl -k -X GET "$NESSUS_HOST/scans/${{ steps.create_scan.outputs.scan_id }}/export/${{ steps.export_scan.outputs.file_id }}/download" \
+          -H "X-Cookie: token=${{ steps.authenticate.outputs.token }}" \
+          -o nessus_report.html
+        env:
+          NESSUS_HOST: ${{ secrets.NESSUS_HOST }}
+
+      - name: Upload Scan Report as Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: nessus-scan-report
+          path: nessus_report.html
